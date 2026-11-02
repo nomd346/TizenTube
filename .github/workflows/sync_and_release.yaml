@@ -27,17 +27,14 @@ jobs:
       - name: Backup Custom Protected Files
         run: |
           mkdir -p /tmp/protected_backup
-          # 1. Custom userscript
           if [ -f "dist/userScript.js" ]; then
             mkdir -p /tmp/protected_backup/dist
             cp dist/userScript.js /tmp/protected_backup/dist/
           fi
-          # 2. Cobalt userscript injector
           if [ -f "third_party/blink/renderer/core/dom/document.cc" ]; then
             mkdir -p /tmp/protected_backup/third_party/blink/renderer/core/dom
             cp third_party/blink/renderer/core/dom/document.cc /tmp/protected_backup/third_party/blink/renderer/core/dom/
           fi
-          # 3. Logo replacements
           mkdir -p /tmp/protected_backup/.github/assets
           cp -r .github/assets/* /tmp/protected_backup/.github/assets/ 2>/dev/null || true
           mkdir -p /tmp/protected_backup/cobalt_android
@@ -49,7 +46,6 @@ jobs:
         run: |
           git remote add upstream https://github.com/reisxd/TizenTubeCobalt.git || true
           git fetch upstream main
-          # Merge upstream main
           git merge upstream/main -X ours --no-edit || true
 
       - name: Restore Custom Protected Files
@@ -76,7 +72,12 @@ jobs:
             git push origin main
           fi
 
-      - name: Check Upstream Releases and Mirror
+      - name: Set up Java and Android Build Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jdk apksigner zipalign python3-pip
+
+      - name: Check Upstream Releases and Build Custom APKs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -85,23 +86,83 @@ jobs:
           UPSTREAM_NAME=$(echo "$UPSTREAM_JSON" | jq -r .name)
           UPSTREAM_BODY=$(echo "$UPSTREAM_JSON" | jq -r .body)
 
-          echo "Latest upstream release: $UPSTREAM_TAG"
+          echo "Checking upstream release tag: $UPSTREAM_TAG"
 
-          if git rev-parse "$UPSTREAM_TAG" >/dev/null 2>&1; then
-            echo "Release $UPSTREAM_TAG already exists on this repository."
+          EXISTING_RELEASE=$(gh release view "$UPSTREAM_TAG" 2>/dev/null || true)
+          if [ -n "$EXISTING_RELEASE" ]; then
+            echo "Release $UPSTREAM_TAG already exists. No new release needed."
             exit 0
           fi
 
-          echo "Creating mirrored release for $UPSTREAM_TAG..."
-          mkdir -p /tmp/release_assets
+          echo "New upstream release detected! Downloading original APKs and injecting custom branding..."
+          mkdir -p /tmp/raw_apks /tmp/custom_apks
 
-          ASSET_URLS=$(echo "$UPSTREAM_JSON" | jq -r '.assets[] | .browser_download_url')
-          for url in $ASSET_URLS; do
-            filename=$(basename "$url")
-            echo "Downloading $filename..."
-            curl -L -s "$url" -o "/tmp/release_assets/$filename"
-          done
+          cat << 'EOF' > /tmp/keystore.b64
+          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
+          EOF
+          base64 -d /tmp/keystore.b64 > /tmp/release.keystore
 
-          gh release create "$UPSTREAM_TAG" /tmp/release_assets/* \
+          python3 - << 'PYEOF'
+          import urllib.request, json, zipfile, io, os, subprocess
+
+          replacements = {
+              'assets/cobalt_logo_1024.png': 'cobalt/android/apk/app/src/app/assets/web/cobalt_logo_1024.png',
+              'res/drawable-hdpi-v4/app_banner': 'cobalt/shell/android/java/res/drawable-hdpi/app_banner.png',
+              'res/drawable-mdpi-v4/app_banner': 'cobalt/shell/android/java/res/drawable-mdpi/app_banner.png',
+              'res/drawable-xhdpi-v4/app_banner': 'cobalt/shell/android/java/res/drawable-xhdpi/app_banner.png',
+              'res/drawable-xxhdpi-v4/app_banner': 'cobalt/shell/android/java/res/drawable-xxhdpi/app_banner.png',
+              'res/drawable-xxxhdpi-v4/app_banner': 'cobalt/shell/android/java/res/drawable-xxxhdpi/app_banner.png',
+              'res/drawable/app_banner': 'cobalt/shell/android/java/res/drawable-xhdpi/app_banner.png',
+              'res/mipmap-hdpi-v4/ic_app': 'cobalt/shell/android/java/res/mipmap-hdpi/ic_app.png',
+              'res/mipmap-mdpi-v4/ic_app': 'cobalt/shell/android/java/res/mipmap-mdpi/ic_app.png',
+              'res/mipmap-xhdpi-v4/ic_app': 'cobalt/shell/android/java/res/mipmap-xhdpi/ic_app.png',
+              'res/mipmap-xxhdpi-v4/ic_app': 'cobalt/shell/android/java/res/mipmap-xxhdpi/ic_app.png',
+              'res/mipmap-xxxhdpi-v4/ic_app': 'cobalt/shell/android/java/res/mipmap-xxxhdpi/ic_app.png'
+          }
+
+          rep_bytes = {}
+          for k, path in replacements.items():
+              if os.path.exists(path):
+                  with open(path, 'rb') as f:
+                      rep_bytes[k] = f.read()
+
+          for arch in ['arm', 'arm64']:
+              dl_url = f'https://github.com/reisxd/TizenTubeCobalt/releases/download/{os.environ.get("UPSTREAM_TAG")}/cobalt-{arch}.apk'
+              print(f'Downloading {dl_url}...')
+              req = urllib.request.Request(dl_url, headers={'User-Agent': 'Actions'})
+              raw_apk = urllib.request.urlopen(req).read()
+
+              in_zip = zipfile.ZipFile(io.BytesIO(raw_apk))
+              out_buf = io.BytesIO()
+              out_zip = zipfile.ZipFile(out_buf, 'w', compression=zipfile.ZIP_DEFLATED)
+
+              for item in in_zip.infolist():
+                  if item.filename.startswith('META-INF/') and (item.filename.endswith('.SF') or item.filename.endswith('.RSA') or item.filename.endswith('.MF')):
+                      continue
+                  c = in_zip.read(item.filename)
+                  if item.filename in rep_bytes:
+                      c = rep_bytes[item.filename]
+                  out_zip.writestr(item, c)
+
+              out_zip.close()
+              patched_path = f'/tmp/custom_apks/cobalt-{arch}-unsigned.apk'
+              with open(patched_path, 'wb') as f:
+                  f.write(out_buf.getvalue())
+
+              signed_path = f'/tmp/custom_apks/cobalt-{arch}.apk'
+              cmd = [
+                  'apksigner', 'sign',
+                  '--ks', '/tmp/release.keystore',
+                  '--ks-pass', 'pass:android',
+                  '--ks-key-alias', 'tizentube',
+                  '--key-pass', 'pass:android',
+                  '--out', signed_path,
+                  patched_path
+              ]
+              subprocess.check_call(cmd)
+              print(f'Signed custom branded APK for {arch}: {signed_path}')
+          PYEOF
+
+          gh release create "$UPSTREAM_TAG" /tmp/custom_apks/*.apk \
             --title "$UPSTREAM_NAME" \
             --notes "$UPSTREAM_BODY"
