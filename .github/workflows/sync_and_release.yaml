@@ -77,7 +77,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openjdk-17-jdk apksigner zipalign python3-pip
 
-      - name: Check Upstream Releases and Build Custom APKs
+      - name: Check Upstream Releases and Build Custom YouTube APKs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -94,7 +94,7 @@ jobs:
             exit 0
           fi
 
-          echo "New upstream release detected! Downloading original APKs and injecting custom branding..."
+          echo "New upstream release detected! Downloading original APKs and injecting YouTube branding..."
           mkdir -p /tmp/raw_apks /tmp/custom_apks
 
           cat << 'EOF' > /tmp/keystore.b64
@@ -103,7 +103,54 @@ jobs:
           base64 -d /tmp/keystore.b64 > /tmp/release.keystore
 
           python3 - << 'PYEOF'
-          import urllib.request, json, zipfile, io, os, subprocess
+          import urllib.request, json, zipfile, io, os, subprocess, struct
+
+          def patch_manifest(data):
+              chunk_type, header_size, chunk_size, string_count, style_count, flags, strings_start, styles_start = struct.unpack('<HHIIIIII', data[8:36])
+              offset_table_start = 8 + header_size
+              offsets = list(struct.unpack(f'<{string_count}I', data[offset_table_start:offset_table_start + string_count * 4]))
+              
+              strings = []
+              pool_data_start = 8 + strings_start
+              target_idx = -1
+              for i, off in enumerate(offsets):
+                  str_start = pool_data_start + off
+                  u16_len = struct.unpack('<H', data[str_start:str_start+2])[0]
+                  val = data[str_start+2:str_start+2+u16_len*2].decode('utf-16le', errors='ignore')
+                  strings.append(val)
+                  if val == 'TizenTube':
+                      target_idx = i
+
+              if target_idx != -1:
+                  strings[target_idx] = 'YouTube'
+              
+              new_pool_data = bytearray()
+              new_offsets = []
+              for s in strings:
+                  new_offsets.append(len(new_pool_data))
+                  u16_bytes = s.encode('utf-16le') + b'\x00\x00'
+                  new_pool_data += struct.pack('<H', len(s)) + u16_bytes
+                      
+              while len(new_pool_data) % 4 != 0:
+                  new_pool_data.append(0)
+                  
+              new_string_count = len(strings)
+              new_strings_start = header_size + new_string_count * 4
+              new_chunk_size = new_strings_start + len(new_pool_data)
+              
+              new_chunk = bytearray()
+              new_chunk += struct.pack('<HHIIIIII', chunk_type, header_size, new_chunk_size, new_string_count, style_count, flags, new_strings_start, styles_start)
+              for off in new_offsets:
+                  new_chunk += struct.pack('<I', off)
+              new_chunk += new_pool_data
+              
+              diff = len(new_chunk) - chunk_size
+              new_file_size = struct.unpack('<I', data[4:8])[0] + diff
+              
+              new_axml = struct.pack('<II', struct.unpack('<I', data[0:4])[0], new_file_size)
+              new_axml += new_chunk
+              new_axml += data[8 + chunk_size:]
+              return bytes(new_axml)
 
           replacements = {
               'assets/cobalt_logo_1024.png': 'cobalt/android/apk/app/src/app/assets/web/cobalt_logo_1024.png',
@@ -142,6 +189,8 @@ jobs:
                   c = in_zip.read(item.filename)
                   if item.filename in rep_bytes:
                       c = rep_bytes[item.filename]
+                  elif item.filename == 'AndroidManifest.xml':
+                      c = patch_manifest(c)
                   out_zip.writestr(item, c)
 
               out_zip.close()
@@ -160,7 +209,7 @@ jobs:
                   patched_path
               ]
               subprocess.check_call(cmd)
-              print(f'Signed custom branded APK for {arch}: {signed_path}')
+              print(f'Signed custom YouTube APK for {arch}: {signed_path}')
           PYEOF
 
           gh release create "$UPSTREAM_TAG" /tmp/custom_apks/*.apk \
