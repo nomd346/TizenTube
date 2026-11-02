@@ -1,0 +1,107 @@
+name: Sync Fork and Mirror Releases
+
+on:
+  schedule:
+    # Run once every Sunday at 00:00 UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Backup Custom Protected Files
+        run: |
+          mkdir -p /tmp/protected_backup
+          # 1. Custom userscript
+          if [ -f "dist/userScript.js" ]; then
+            mkdir -p /tmp/protected_backup/dist
+            cp dist/userScript.js /tmp/protected_backup/dist/
+          fi
+          # 2. Cobalt userscript injector
+          if [ -f "third_party/blink/renderer/core/dom/document.cc" ]; then
+            mkdir -p /tmp/protected_backup/third_party/blink/renderer/core/dom
+            cp third_party/blink/renderer/core/dom/document.cc /tmp/protected_backup/third_party/blink/renderer/core/dom/
+          fi
+          # 3. Logo replacements
+          mkdir -p /tmp/protected_backup/.github/assets
+          cp -r .github/assets/* /tmp/protected_backup/.github/assets/ 2>/dev/null || true
+          mkdir -p /tmp/protected_backup/cobalt_android
+          cp -r cobalt/android/apk/app/src/app/assets/web/cobalt_logo_1024.png /tmp/protected_backup/cobalt_android/ 2>/dev/null || true
+          mkdir -p /tmp/protected_backup/cobalt_shell
+          cp -r cobalt/shell/* /tmp/protected_backup/cobalt_shell/ 2>/dev/null || true
+
+      - name: Sync upstream changes
+        run: |
+          git remote add upstream https://github.com/reisxd/TizenTubeCobalt.git || true
+          git fetch upstream main
+          # Merge upstream main
+          git merge upstream/main -X ours --no-edit || true
+
+      - name: Restore Custom Protected Files
+        run: |
+          if [ -d /tmp/protected_backup/dist ]; then
+            cp -r /tmp/protected_backup/dist/* dist/ 2>/dev/null || true
+          fi
+          if [ -f /tmp/protected_backup/third_party/blink/renderer/core/dom/document.cc ]; then
+            cp /tmp/protected_backup/third_party/blink/renderer/core/dom/document.cc third_party/blink/renderer/core/dom/document.cc
+          fi
+          if [ -d /tmp/protected_backup/.github/assets ]; then
+            cp -r /tmp/protected_backup/.github/assets/* .github/assets/ 2>/dev/null || true
+          fi
+          if [ -f /tmp/protected_backup/cobalt_android/cobalt_logo_1024.png ]; then
+            cp /tmp/protected_backup/cobalt_android/cobalt_logo_1024.png cobalt/android/apk/app/src/app/assets/web/cobalt_logo_1024.png
+          fi
+          if [ -d /tmp/protected_backup/cobalt_shell ]; then
+            cp -r /tmp/protected_backup/cobalt_shell/* cobalt/shell/ 2>/dev/null || true
+          fi
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add .
+            git commit -m "chore: sync with upstream while preserving custom logos and updater config"
+            git push origin main
+          fi
+
+      - name: Check Upstream Releases and Mirror
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_JSON=$(curl -s -H "User-Agent: Actions" https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest)
+          UPSTREAM_TAG=$(echo "$UPSTREAM_JSON" | jq -r .tag_name)
+          UPSTREAM_NAME=$(echo "$UPSTREAM_JSON" | jq -r .name)
+          UPSTREAM_BODY=$(echo "$UPSTREAM_JSON" | jq -r .body)
+
+          echo "Latest upstream release: $UPSTREAM_TAG"
+
+          if git rev-parse "$UPSTREAM_TAG" >/dev/null 2>&1; then
+            echo "Release $UPSTREAM_TAG already exists on this repository."
+            exit 0
+          fi
+
+          echo "Creating mirrored release for $UPSTREAM_TAG..."
+          mkdir -p /tmp/release_assets
+
+          ASSET_URLS=$(echo "$UPSTREAM_JSON" | jq -r '.assets[] | .browser_download_url')
+          for url in $ASSET_URLS; do
+            filename=$(basename "$url")
+            echo "Downloading $filename..."
+            curl -L -s "$url" -o "/tmp/release_assets/$filename"
+          done
+
+          gh release create "$UPSTREAM_TAG" /tmp/release_assets/* \
+            --title "$UPSTREAM_NAME" \
+            --notes "$UPSTREAM_BODY"
